@@ -51,6 +51,7 @@ class VanillaTransformer(BaseModel):
     `n_head`: int=4, controls number of multi-head's attention.<br>
         `conv_hidden_size`: int=32, channels of the convolutional encoder.<br>
         `activation`: str=`GELU`, activation from ['ReLU', 'Softplus', 'Tanh', 'SELU', 'LeakyReLU', 'PReLU', 'Sigmoid', 'GELU'].<br>
+    `atten`: str, attention type, 'full' or 'flash'.<br>
     `encoder_layers`: int=2, number of layers for the TCN encoder.<br>
     `decoder_layers`: int=1, number of layers for the MLP decoder.<br>
     `atten`: str, attention type, 'full' or 'flash'.<br>
@@ -105,6 +106,7 @@ class VanillaTransformer(BaseModel):
         n_head: int = 4,
         conv_hidden_size: int = 32,
         activation: str = "gelu",
+        atten: str = "full",
         encoder_layers: int = 2,
         decoder_layers: int = 1,
         atten: str = "full",
