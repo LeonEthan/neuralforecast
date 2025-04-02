@@ -184,8 +184,8 @@ class TimeXer(BaseModel):
 
     # Class attributes
     EXOGENOUS_FUTR = True
-    EXOGENOUS_HIST = False
-    EXOGENOUS_STAT = False
+    EXOGENOUS_HIST = True
+    EXOGENOUS_STAT = True
     MULTIVARIATE = True  # If the model produces multivariate forecasts (True) or univariate (False)
     RECURRENT = (
         False  # If the model produces forecasts recursively (True) or direct (False)
@@ -277,13 +277,23 @@ class TimeXer(BaseModel):
         self.use_norm = use_norm
         self.patch_num = int(input_size // self.patch_len)
 
+        self.futr_exog_size = len(futr_exog_list) if futr_exog_list is not None else 0
+        self.hist_exog_size = len(hist_exog_list) if hist_exog_list is not None else 0
+        self.stat_exog_size = len(stat_exog_list) if stat_exog_list is not None else 0
+
         # Architecture
         self.en_embedding = EnEmbedding(
             n_series, self.hidden_size, self.patch_len, self.dropout
         )
-        self.ex_embedding = DataEmbedding_inverted(
+        self.hist_ex_embedding = DataEmbedding_inverted(
             input_size, self.hidden_size, self.dropout
         )
+        if futr_exog_list is not None:
+            self.futr_ex_embedding = DataEmbedding_inverted(
+                input_size + h, self.hidden_size, self.dropout
+            )
+        if stat_exog_list is not None:
+            self.stat_ex_embedding = nn.Linear(len(stat_exog_list), hidden_size)
 
         self.encoder = Encoder(
             [
@@ -327,7 +337,7 @@ class TimeXer(BaseModel):
             head_dropout=self.dropout,
         )
 
-    def forecast(self, x_enc, x_mark_enc):
+    def forecast(self, x_enc, futr_exog, hist_exog, stat_exog):
         if self.use_norm:
             # Normalization from Non-stationary Transformer
             means = x_enc.mean(1, keepdim=True).detach()
@@ -337,10 +347,24 @@ class TimeXer(BaseModel):
             )
             x_enc /= stdev
 
-        _, _, N = x_enc.shape
+        B, _, N = x_enc.shape
 
         en_embed, n_vars = self.en_embedding(x_enc.permute(0, 2, 1))
-        ex_embed = self.ex_embedding(x_enc, x_mark_enc)
+        # concat exogenous embedding if exist
+        if self.hist_exog_size > 0:
+            B, V, T, D = hist_exog.shape
+            ex_embed = self.hist_ex_embedding(x_enc, hist_exog.reshape(B, T, V * D))
+        else:
+            ex_embed = self.hist_ex_embedding(x_enc, None)
+        if self.futr_exog_size > 0:
+            B, V, T, D = futr_exog.shape
+            futr_ex_embed = self.futr_ex_embedding(futr_exog.reshape(B, T, V * D), None)
+            ex_embed = torch.cat([ex_embed, futr_ex_embed], dim=1)
+        if self.stat_exog_size > 0:
+            # stat_exog: [N, S] -> [N, E] -> [B, N, E]
+            stat_embed = self.stat_ex_embedding(stat_exog)  # [N, E]
+            stat_embed = stat_embed.unsqueeze(0).expand(B, -1, -1)  # [B, N, E]
+            ex_embed = torch.cat([ex_embed, stat_embed], dim=1)
 
         enc_out = self.encoder(en_embed, ex_embed)
         enc_out = torch.reshape(
@@ -368,16 +392,13 @@ class TimeXer(BaseModel):
         return dec_out
 
     def forward(self, windows_batch):
-        insample_y = windows_batch["insample_y"]
-        futr_exog = windows_batch["futr_exog"]
+        insample_y = windows_batch[
+            "insample_y"
+        ]  #   [batch_size (B), input_size (L), n_series (N)]
+        hist_exog = windows_batch["hist_exog"]  #   [B, hist_exog_size (X), L, N]
+        futr_exog = windows_batch["futr_exog"]  #   [B, futr_exog_size (F), L + h, N]
+        stat_exog = windows_batch["stat_exog"]  #   [N, stat_exog_size (S)]
 
-        if self.futr_exog_size > 0:
-            x_mark_enc = futr_exog[:, :, : self.input_size, :]
-            B, V, T, D = x_mark_enc.shape
-            x_mark_enc = x_mark_enc.reshape(B, T, V * D)
-        else:
-            x_mark_enc = None
-
-        y_pred = self.forecast(insample_y, x_mark_enc)
+        y_pred = self.forecast(insample_y, futr_exog, hist_exog, stat_exog)
         y_pred = y_pred.reshape(insample_y.shape[0], self.h, -1)
         return y_pred

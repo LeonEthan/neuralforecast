@@ -84,8 +84,8 @@ class VanillaTransformer(BaseModel):
 
     # Class attributes
     EXOGENOUS_FUTR = True
-    EXOGENOUS_HIST = False
-    EXOGENOUS_STAT = False
+    EXOGENOUS_HIST = True
+    EXOGENOUS_STAT = True
     MULTIVARIATE = False  # If the model produces multivariate forecasts (True) or univariate (False)
     RECURRENT = (
         False  # If the model produces forecasts recursively (True) or direct (False)
@@ -182,14 +182,16 @@ class VanillaTransformer(BaseModel):
         # Embedding
         self.enc_embedding = DataEmbedding(
             c_in=self.enc_in,
-            exog_input_size=self.futr_exog_size,
+            exog_input_size=self.futr_exog_size
+            + self.stat_exog_size
+            + self.hist_exog_size,
             hidden_size=hidden_size,
             pos_embedding=True,
             dropout=dropout,
         )
         self.dec_embedding = DataEmbedding(
             self.dec_in,
-            exog_input_size=self.futr_exog_size,
+            exog_input_size=self.futr_exog_size + self.stat_exog_size,
             hidden_size=hidden_size,
             pos_embedding=True,
             dropout=dropout,
@@ -257,12 +259,40 @@ class VanillaTransformer(BaseModel):
         # Parse windows_batch
         insample_y = windows_batch["insample_y"]
         futr_exog = windows_batch["futr_exog"]
+        hist_exog = windows_batch["hist_exog"]
+        stat_exog = windows_batch["stat_exog"]
 
-        if self.futr_exog_size > 0:
-            x_mark_enc = futr_exog[:, : self.input_size, :]
-            x_mark_dec = futr_exog[:, -(self.label_len + self.h) :, :]
+        # 拼接所有外部特征
+        if (
+            self.futr_exog_size > 0
+            or self.hist_exog_size > 0
+            or self.stat_exog_size > 0
+        ):
+            features = []
+            # Encoder特征
+            if self.futr_exog_size > 0:
+                features.append(futr_exog[:, : self.input_size, :])
+            if self.hist_exog_size > 0:
+                features.append(hist_exog[:, : self.input_size, :])
+            if self.stat_exog_size > 0:
+                stat_enc = stat_exog.unsqueeze(1).repeat(1, self.input_size, 1)
+                features.append(stat_enc)
+            x_mark_enc = torch.cat(features, dim=-1) if features else None
         else:
             x_mark_enc = None
+
+        # Decoder特征
+        if self.futr_exog_size > 0 or self.stat_exog_size > 0:
+            features_dec = []
+            if self.futr_exog_size > 0:
+                features_dec.append(futr_exog[:, -(self.label_len + self.h) :, :])
+            if self.stat_exog_size > 0:
+                stat_dec = stat_exog.unsqueeze(1).repeat(1, futr_exog.size(1), 1)[
+                    :, -(self.label_len + self.h) :, :
+                ]
+                features_dec.append(stat_dec)
+            x_mark_dec = torch.cat(features_dec, dim=-1) if features_dec else None
+        else:
             x_mark_dec = None
 
         x_dec = torch.zeros(size=(len(insample_y), self.h, 1), device=insample_y.device)

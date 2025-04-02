@@ -80,6 +80,77 @@ class STAD(nn.Module):
         return output, None
 
 # %% ../../nbs/models.softs.ipynb 10
+class FeatureEmbedding(nn.Module):
+    """
+    特征融合模块，通过分通道嵌入实现参数控制：
+    1. 将原始hidden_size均分给各特征通道
+    2. 各特征独立进行嵌入编码
+    3. 沿特征维度拼接最终结果
+    """
+
+    def __init__(
+        self,
+        input_size,
+        h,
+        hidden_size,
+        hist_exog_size,
+        futr_exog_size,
+        stat_exog_size,
+        dropout,
+    ):
+        super().__init__()
+        self.futr_input_size = input_size + h
+        self.futr_exog_size = futr_exog_size
+        self.hist_exog_size = hist_exog_size
+        self.stat_exog_size = stat_exog_size
+        self.base_embed = DataEmbedding_inverted(input_size, hidden_size, dropout)
+
+        # 历史特征编码器
+        self.hist_embed = nn.ModuleList(
+            [
+                DataEmbedding_inverted(input_size, hidden_size, dropout)
+                for _ in range(hist_exog_size)
+            ]
+        )
+
+        # 未来特征编码器（使用历史部分）
+        self.futr_embed = nn.ModuleList(
+            [
+                DataEmbedding_inverted(self.futr_input_size, hidden_size, dropout)
+                for _ in range(futr_exog_size)
+            ]
+        )
+        # 静态特征编码（通过线性映射）
+        self.stat_embed = (
+            nn.Linear(stat_exog_size, hidden_size) if stat_exog_size > 0 else None
+        )
+
+    def forward(self, y, hist, futr, stat):
+        # 基础序列嵌入 [B, N, E]
+        embeddings = [self.base_embed(y, None)]
+
+        # 历史特征嵌入 [B, N, E] * H
+        if self.hist_exog_size > 0:
+            for i, embed in enumerate(self.hist_embed):
+                embeddings.append(embed(hist[:, i, :, :], None))
+
+        # 未来特征嵌入 [B, N, E] * F
+        if self.futr_exog_size > 0:
+            for i, embed in enumerate(self.futr_embed):
+                embeddings.append(embed(futr[:, i, :, :], None))
+
+        # 静态特征嵌入 [B, N, E]
+        if self.stat_embed is not None:
+            stat_feat = self.stat_embed(stat)  # [N, S] -> [N, E]
+            stat_feat = stat_feat.unsqueeze(0).expand(
+                y.size(0), -1, -1
+            )  # [N, E] -> [B, N, E]
+            embeddings.append(stat_feat)
+
+        # 沿特征维度拼接 [B, N, E*(1+H+F+S)]
+        return torch.cat(embeddings, dim=-1)
+
+# %% ../../nbs/models.softs.ipynb 12
 class SOFTS(BaseModel):
     """SOFTS
 
@@ -126,9 +197,9 @@ class SOFTS(BaseModel):
     """
 
     # Class attributes
-    EXOGENOUS_FUTR = False
-    EXOGENOUS_HIST = False
-    EXOGENOUS_STAT = False
+    EXOGENOUS_FUTR = True
+    EXOGENOUS_HIST = True
+    EXOGENOUS_STAT = True
     MULTIVARIATE = True
     RECURRENT = False
 
@@ -212,7 +283,24 @@ class SOFTS(BaseModel):
         self.use_norm = use_norm
 
         # Architecture
-        self.enc_embedding = DataEmbedding_inverted(input_size, hidden_size, dropout)
+        # Mix all features into one
+        self.num_features = (
+            1
+            + (len(hist_exog_list) if hist_exog_list else 0)
+            + (len(futr_exog_list) if futr_exog_list else 0)
+            + (len(stat_exog_list) if stat_exog_list else 0)
+        )
+        adjusted_hidden = hidden_size // self.num_features
+        self.hidden_size = adjusted_hidden * self.num_features
+        self.feature_embedding = FeatureEmbedding(
+            input_size=input_size,
+            h=h,
+            hidden_size=adjusted_hidden,
+            hist_exog_size=len(hist_exog_list) if hist_exog_list else 0,
+            futr_exog_size=len(futr_exog_list) if futr_exog_list else 0,
+            stat_exog_size=len(stat_exog_list) if stat_exog_list else 0,
+            dropout=dropout,
+        )
 
         self.encoder = TransEncoder(
             [
@@ -231,7 +319,7 @@ class SOFTS(BaseModel):
             hidden_size, self.h * self.loss.outputsize_multiplier, bias=True
         )
 
-    def forecast(self, x_enc):
+    def forecast(self, x_enc, hist_exog, futr_exog, stat_exog):
         # Normalization from Non-stationary Transformer
         if self.use_norm:
             means = x_enc.mean(1, keepdim=True).detach()
@@ -242,7 +330,7 @@ class SOFTS(BaseModel):
             x_enc /= stdev
 
         _, _, N = x_enc.shape
-        enc_out = self.enc_embedding(x_enc, None)
+        enc_out = self.feature_embedding(x_enc, hist_exog, futr_exog, stat_exog)
         enc_out, attns = self.encoder(enc_out, attn_mask=None)
         dec_out = self.projection(enc_out).permute(0, 2, 1)[:, :, :N]
 
@@ -261,9 +349,14 @@ class SOFTS(BaseModel):
         return dec_out
 
     def forward(self, windows_batch):
-        insample_y = windows_batch["insample_y"]
+        insample_y = windows_batch[
+            "insample_y"
+        ]  #   [batch_size (B), input_size (L), n_series (N)]
+        hist_exog = windows_batch["hist_exog"]  #   [B, hist_exog_size (X), L, N]
+        futr_exog = windows_batch["futr_exog"]  #   [B, futr_exog_size (F), L + h, N]
+        stat_exog = windows_batch["stat_exog"]  #   [N, stat_exog_size (S)]
 
-        y_pred = self.forecast(insample_y)
+        y_pred = self.forecast(insample_y, hist_exog, futr_exog, stat_exog)
         y_pred = y_pred.reshape(insample_y.shape[0], self.h, -1)
 
         return y_pred
