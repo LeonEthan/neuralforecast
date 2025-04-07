@@ -19,10 +19,12 @@ class DataEmbedding_inverted(nn.Module):
     Data Embedding
     """
 
-    def __init__(self, c_in, d_model, dropout=0.1):
+    def __init__(self, c_in, d_model, dropout=0.1, embed_norm=True):
         super(DataEmbedding_inverted, self).__init__()
+        self.embed_norm = embed_norm
         self.value_embedding = nn.Linear(c_in, d_model)
         self.dropout = nn.Dropout(p=dropout)
+        self.norm = nn.LayerNorm(d_model) if embed_norm else None
 
     def forward(self, x, x_mark):
         x = x.permute(0, 2, 1)
@@ -33,6 +35,7 @@ class DataEmbedding_inverted(nn.Module):
             # the potential to take covariates (e.g. timestamps) as tokens
             x = self.value_embedding(torch.cat([x, x_mark.permute(0, 2, 1)], 1))
         # x: [Batch Variate d_model]
+        x = self.norm(x) if self.embed_norm else x
         return self.dropout(x)
 
 # %% ../../nbs/models.softs.ipynb 8
@@ -97,18 +100,21 @@ class FeatureEmbedding(nn.Module):
         futr_exog_size,
         stat_exog_size,
         dropout,
+        embed_norm,
     ):
         super().__init__()
         self.futr_input_size = input_size + h
         self.futr_exog_size = futr_exog_size
         self.hist_exog_size = hist_exog_size
         self.stat_exog_size = stat_exog_size
-        self.base_embed = DataEmbedding_inverted(input_size, hidden_size, dropout)
+        self.base_embed = DataEmbedding_inverted(
+            input_size, hidden_size, dropout, embed_norm
+        )
 
         # 历史特征编码器
         self.hist_embed = nn.ModuleList(
             [
-                DataEmbedding_inverted(input_size, hidden_size, dropout)
+                DataEmbedding_inverted(input_size, hidden_size, dropout, embed_norm)
                 for _ in range(hist_exog_size)
             ]
         )
@@ -116,14 +122,20 @@ class FeatureEmbedding(nn.Module):
         # 未来特征编码器（使用历史部分）
         self.futr_embed = nn.ModuleList(
             [
-                DataEmbedding_inverted(self.futr_input_size, hidden_size, dropout)
+                DataEmbedding_inverted(
+                    self.futr_input_size, hidden_size, dropout, embed_norm
+                )
                 for _ in range(futr_exog_size)
             ]
         )
         # 静态特征编码（通过线性映射）
-        self.stat_embed = (
-            nn.Linear(stat_exog_size, hidden_size) if stat_exog_size > 0 else None
-        )
+        if stat_exog_size > 0:
+            layers = [nn.Linear(stat_exog_size, hidden_size)]
+            if embed_norm:
+                layers.append(nn.BatchNorm1d(hidden_size))
+            self.stat_embed = nn.Sequential(*layers)
+        else:
+            self.stat_embed = None
 
     def forward(self, y, hist, futr, stat):
         # 基础序列嵌入 [B, N, E]
@@ -142,9 +154,7 @@ class FeatureEmbedding(nn.Module):
         # 静态特征嵌入 [B, N, E]
         if self.stat_embed is not None:
             stat_feat = self.stat_embed(stat)  # [N, S] -> [N, E]
-            stat_feat = stat_feat.unsqueeze(0).expand(
-                y.size(0), -1, -1
-            )  # [N, E] -> [B, N, E]
+            stat_feat = stat_feat.unsqueeze(0).expand(y.size(0), -1, -1)  # [B, N, E]
             embeddings.append(stat_feat)
 
         # 沿特征维度拼接 [B, N, E*(1+H+F+S)]
@@ -168,6 +178,7 @@ class SOFTS(BaseModel):
     `d_ff`: int, dimension of fully-connected layer.<br>
     `dropout`: float, dropout rate.<br>
     `use_norm`: bool, whether to normalize or not.<br>
+    `embed_norm`: bool, whether to apply normalization to various embedding layers.<br>
     `loss`: PyTorch module, instantiated train loss class from [losses collection](https://nixtla.github.io/neuralforecast/losses.pytorch.html).<br>
     `valid_loss`: PyTorch module=`loss`, instantiated valid loss class from [losses collection](https://nixtla.github.io/neuralforecast/losses.pytorch.html).<br>
     `max_steps`: int=1000, maximum number of training steps.<br>
@@ -218,6 +229,7 @@ class SOFTS(BaseModel):
         d_ff: int = 2048,
         dropout: float = 0.1,
         use_norm: bool = True,
+        embed_norm: bool = True,
         loss=MAE(),
         valid_loss=None,
         max_steps: int = 1000,
@@ -288,7 +300,7 @@ class SOFTS(BaseModel):
             1
             + (len(hist_exog_list) if hist_exog_list else 0)
             + (len(futr_exog_list) if futr_exog_list else 0)
-            + (len(stat_exog_list) if stat_exog_list else 0)
+            + 1
         )
         adjusted_hidden = hidden_size // self.num_features
         self.hidden_size = adjusted_hidden * self.num_features
@@ -300,13 +312,14 @@ class SOFTS(BaseModel):
             futr_exog_size=len(futr_exog_list) if futr_exog_list else 0,
             stat_exog_size=len(stat_exog_list) if stat_exog_list else 0,
             dropout=dropout,
+            embed_norm=embed_norm,
         )
 
         self.encoder = TransEncoder(
             [
                 TransEncoderLayer(
-                    STAD(hidden_size, d_core),
-                    hidden_size,
+                    STAD(self.hidden_size, d_core),
+                    self.hidden_size,
                     d_ff,
                     dropout=dropout,
                     activation=F.gelu,
@@ -316,7 +329,7 @@ class SOFTS(BaseModel):
         )
 
         self.projection = nn.Linear(
-            hidden_size, self.h * self.loss.outputsize_multiplier, bias=True
+            self.hidden_size, self.h * self.loss.outputsize_multiplier, bias=True
         )
 
     def forecast(self, x_enc, hist_exog, futr_exog, stat_exog):
